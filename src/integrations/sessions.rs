@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, process::Command, sync::OnceLock};
+use std::{collections::HashSet, env, path::PathBuf, process::Command, sync::OnceLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -42,13 +42,116 @@ pub(crate) fn collect_sessions(config: &Config) -> Vec<Entry> {
     entries
 }
 
+#[derive(Debug, Deserialize)]
+struct ListedMachine {
+    label: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    selected: bool,
+}
+
+fn listed_machines() -> Vec<ListedMachine> {
+    let json = herdr_json(["machine", "list", "--json"]).unwrap_or(Value::Null);
+    // Accept a bare `[...]` array or a `machines: [...]` envelope, mirroring
+    // the session-list tolerance above.
+    let parsed: Vec<ListedMachine> = serde_json::from_value(json.clone())
+        .or_else(|_| {
+            serde_json::from_value(json.pointer("/machines").cloned().unwrap_or(Value::Null))
+        })
+        .unwrap_or_default();
+    parsed
+}
+
 pub(crate) fn collect_remotes(config: &Config) -> Vec<Entry> {
-    config
-        .sessions
-        .entries
+    let mut targets = HashSet::new();
+    let mut entries = Vec::new();
+    for machine in listed_machines() {
+        let Some(entry) = machine_entry(&machine, &config.sessions.entries, &mut targets) else {
+            continue;
+        };
+        entries.push(entry);
+    }
+    entries.extend(
+        config
+            .sessions
+            .entries
+            .iter()
+            .filter(|config| {
+                config
+                    .remote
+                    .as_deref()
+                    .is_some_and(|target| !targets.contains(target))
+            })
+            .filter_map(remote_entry),
+    );
+    entries
+}
+
+fn machine_entry(
+    machine: &ListedMachine,
+    manual: &[SessionEntryConfig],
+    targets: &mut HashSet<String>,
+) -> Option<Entry> {
+    let target = machine.target.clone()?;
+    targets.insert(target.clone());
+    let label = machine
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(&target)
+        .to_string();
+
+    // Tag this machine when an operator-managed `[[sessions]]` entry points
+    // at the same target so it stays discoverable by that entry's tags.
+    let mut search_terms: Vec<String> = vec!["server".into(), "remote".into(), "machine".into()];
+    if let Some(entry) = manual
         .iter()
-        .filter_map(remote_entry)
-        .collect()
+        .find(|entry| entry.remote.as_deref() == Some(target.as_str()))
+    {
+        search_terms.extend(entry.tags.iter().cloned());
+    }
+    search_terms.push(target.clone());
+    search_terms.push(label.clone());
+
+    let mut flags = Vec::new();
+    if machine.selected {
+        flags.push("connected");
+    }
+    if !machine.enabled {
+        flags.push("disabled");
+    }
+    if let Some(session) = machine.session.as_deref().filter(|s| !s.is_empty()) {
+        flags.push(session);
+    }
+    let subtitle = if flags.is_empty() {
+        format!("ssh machine · {target}")
+    } else {
+        format!("ssh machine · {flags} · {target}", flags = flags.join(" · "))
+    };
+
+    Some(Entry {
+        source: Source::Server,
+        title: label,
+        subtitle,
+        path: PathBuf::from(format!("remote:{target}")),
+        workspace_id: None,
+        workspace_label: None,
+        agent_target: None,
+        project: None,
+        action: EntryAction::OpenRemote {
+            target: target.clone(),
+        },
+        source_label: None,
+        search_terms,
+        agent_kind: None,
+        agent_task: None,
+        canonical: OnceLock::new(),
+    })
 }
 
 fn collect_local_sessions() -> Vec<Entry> {
@@ -222,5 +325,103 @@ mod tests {
             entry.action,
             EntryAction::OpenRemote { ref target } if target == "prod-box"
         ));
+    }
+
+    fn machine(
+        label: Option<&str>,
+        target: &str,
+        enabled: bool,
+        selected: bool,
+        session: Option<&str>,
+    ) -> ListedMachine {
+        ListedMachine {
+            label: label.map(String::from),
+            target: Some(target.into()),
+            session: session.map(String::from),
+            enabled,
+            selected,
+        }
+    }
+
+    #[test]
+    fn listed_machine_becomes_server_entry_with_status_flags() {
+        let mut targets = HashSet::new();
+        let entry = machine_entry(
+            &machine(Some("Work Box"), "aliz@work", true, true, Some("main")),
+            &[],
+            &mut targets,
+        )
+        .unwrap();
+
+        assert_eq!(entry.source, Source::Server);
+        assert_eq!(entry.title, "Work Box");
+        assert!(entry.subtitle.contains("connected"));
+        assert!(entry.subtitle.contains("main"));
+        assert!(entry.subtitle.contains("aliz@work"));
+        assert!(entry.haystack().contains("work box"));
+        assert!(matches!(
+            entry.action,
+            EntryAction::OpenRemote { ref target } if target == "aliz@work"
+        ));
+        assert!(targets.contains("aliz@work"));
+    }
+
+    #[test]
+    fn unlabeled_machine_uses_target_as_title_and_marks_disabled() {
+        let mut targets = HashSet::new();
+        let entry = machine_entry(&machine(None, "build@ci", false, false, None), &[], &mut targets)
+            .unwrap();
+
+        assert_eq!(entry.title, "build@ci");
+        assert!(entry.subtitle.contains("disabled"));
+    }
+
+    #[test]
+    fn machine_without_target_is_skipped() {
+        let mut targets = HashSet::new();
+        let ghost = ListedMachine {
+            label: Some("ghost".into()),
+            target: None,
+            session: None,
+            enabled: true,
+            selected: false,
+        };
+        assert!(machine_entry(&ghost, &[], &mut targets).is_none());
+    }
+
+    #[test]
+    fn manual_entry_matching_a_listed_machine_contributes_its_tags() {
+        let mut targets = HashSet::new();
+        let manual = vec![SessionEntryConfig {
+            name: "prod".into(),
+            remote: Some("prod-box".into()),
+            session: None,
+            tags: vec!["api".into()],
+        }];
+        let entry = machine_entry(
+            &machine(Some("prod"), "prod-box", true, false, None),
+            &manual,
+            &mut targets,
+        )
+        .unwrap();
+
+        assert!(entry.search_terms.iter().any(|t| t == "api"));
+    }
+
+    #[test]
+    fn listed_machines_parse_bare_array_and_machines_envelope() {
+        let bare: Vec<ListedMachine> =
+            serde_json::from_str(r#"[{"label":"a","target":"u@h","enabled":true}]"#).unwrap();
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].label.as_deref(), Some("a"));
+
+        let envelope: Vec<ListedMachine> = serde_json::from_str::<serde_json::Value>(
+            r#"{"machines":[{"target":"u@h2","selected":true,"enabled":true}]}"#,
+        )
+        .ok()
+        .and_then(|json| serde_json::from_value(json.pointer("/machines").cloned().unwrap()).ok())
+        .unwrap();
+        assert_eq!(envelope.len(), 1);
+        assert!(envelope[0].selected);
     }
 }
